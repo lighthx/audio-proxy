@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
 use proxy::{ProxyConfig, ProxyServer};
@@ -18,6 +19,12 @@ struct Args {
 
     #[arg(long = "allow-domain", action = ArgAction::Append)]
     allow_domains: Vec<String>,
+
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -34,7 +41,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = ProxyConfig::new(allowed_domains);
     let server = ProxyServer::new(config);
 
-    server.run(args.listen).await?;
+    match (args.tls_cert, args.tls_key) {
+        (Some(cert_path), Some(key_path)) => {
+            server.run_tls(args.listen, cert_path, key_path).await?
+        }
+        (None, None) => server.run(args.listen).await?,
+        _ => {
+            return Err("--tls-cert and --tls-key must be provided together".into());
+        }
+    }
+
     Ok(())
 }
 

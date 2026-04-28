@@ -1,7 +1,10 @@
 use std::{
     convert::Infallible,
+    fs::File,
     io,
+    io::BufReader,
     net::SocketAddr,
+    path::Path,
     pin::Pin,
     str,
     sync::Arc,
@@ -28,6 +31,13 @@ use hyper_util::{
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
+};
+use tokio_rustls::{
+    TlsAcceptor,
+    rustls::{
+        ServerConfig,
+        pki_types::{CertificateDer, PrivateKeyDer},
+    },
 };
 use tracing::{debug, error, info, warn};
 
@@ -116,11 +126,52 @@ impl ProxyServer {
         }
     }
 
-    async fn handle_connection(
-        self: Arc<Self>,
-        mut stream: TcpStream,
-        peer_addr: SocketAddr,
+    pub async fn run_tls(
+        self,
+        listen: SocketAddr,
+        cert_path: impl AsRef<Path>,
+        key_path: impl AsRef<Path>,
     ) -> io::Result<()> {
+        let listener = TcpListener::bind(listen).await?;
+        let tls_acceptor = load_tls_acceptor(cert_path, key_path)?;
+
+        info!(
+            listen = %listener.local_addr()?,
+            allowed_domains = ?self.config.allowed_domains(),
+            "HTTPS proxy listening"
+        );
+
+        let server = Arc::new(self);
+
+        loop {
+            let (stream, peer_addr) = listener.accept().await?;
+            let server = Arc::clone(&server);
+            let tls_acceptor = tls_acceptor.clone();
+
+            tokio::spawn(async move {
+                let stream = match tls_acceptor.accept(stream).await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        debug!(%peer_addr, error = %err, "TLS handshake failed");
+                        return;
+                    }
+                };
+
+                if let Err(err) = server.handle_connection(stream, peer_addr).await {
+                    debug!(%peer_addr, error = %err, "connection closed with error");
+                }
+            });
+        }
+    }
+
+    async fn handle_connection<S>(
+        self: Arc<Self>,
+        mut stream: S,
+        peer_addr: SocketAddr,
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let initial = match read_initial_header(&mut stream).await {
             Ok(initial) => initial,
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
@@ -142,12 +193,15 @@ impl ProxyServer {
         self.handle_http(stream, initial, peer_addr).await
     }
 
-    async fn handle_connect(
+    async fn handle_connect<S>(
         &self,
-        mut client_stream: TcpStream,
+        mut client_stream: S,
         initial: Vec<u8>,
         peer_addr: SocketAddr,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         let header_end = find_header_end(&initial)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing header end"))?;
         let header = &initial[..header_end];
@@ -241,12 +295,15 @@ impl ProxyServer {
         Ok(())
     }
 
-    async fn handle_http(
+    async fn handle_http<S>(
         self: Arc<Self>,
-        stream: TcpStream,
+        stream: S,
         initial: Vec<u8>,
         peer_addr: SocketAddr,
-    ) -> io::Result<()> {
+    ) -> io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let io = PrefixedIo::new(initial, stream);
         let service = service_fn(move |req| {
             let server = Arc::clone(&self);
@@ -456,7 +513,58 @@ fn host_without_port(host: &str) -> &str {
     host.split(':').next().unwrap_or(host)
 }
 
-async fn read_initial_header(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+fn load_tls_acceptor(
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+) -> io::Result<TlsAcceptor> {
+    let certs = load_certs(cert_path.as_ref())?;
+    let key = load_private_key(key_path.as_ref())?;
+
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+
+    if certs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no certificates found in {}", path.display()),
+        ));
+    }
+
+    Ok(certs)
+}
+
+fn load_private_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
+    let mut reader = BufReader::new(File::open(path)?);
+
+    for item in rustls_pemfile::read_all(&mut reader) {
+        match item? {
+            rustls_pemfile::Item::Pkcs1Key(key) => return Ok(PrivateKeyDer::Pkcs1(key)),
+            rustls_pemfile::Item::Pkcs8Key(key) => return Ok(PrivateKeyDer::Pkcs8(key)),
+            rustls_pemfile::Item::Sec1Key(key) => return Ok(PrivateKeyDer::Sec1(key)),
+            _ => {}
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("no private key found in {}", path.display()),
+    ))
+}
+
+async fn read_initial_header<S>(stream: &mut S) -> io::Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = [0_u8; 1024];
 
@@ -526,7 +634,10 @@ fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
     headers.remove(UPGRADE);
 }
 
-async fn write_plain_response(stream: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
+async fn write_plain_response<S>(stream: &mut S, status: &str, body: &str) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -559,14 +670,14 @@ fn normalize_domain(domain: &str) -> String {
         .to_ascii_lowercase()
 }
 
-struct PrefixedIo {
+struct PrefixedIo<S> {
     prefix: Vec<u8>,
     position: usize,
-    stream: TcpStream,
+    stream: S,
 }
 
-impl PrefixedIo {
-    fn new(prefix: Vec<u8>, stream: TcpStream) -> Self {
+impl<S> PrefixedIo<S> {
+    fn new(prefix: Vec<u8>, stream: S) -> Self {
         Self {
             prefix,
             position: 0,
@@ -575,7 +686,10 @@ impl PrefixedIo {
     }
 }
 
-impl AsyncRead for PrefixedIo {
+impl<S> AsyncRead for PrefixedIo<S>
+where
+    S: AsyncRead + Unpin,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -595,7 +709,10 @@ impl AsyncRead for PrefixedIo {
     }
 }
 
-impl AsyncWrite for PrefixedIo {
+impl<S> AsyncWrite for PrefixedIo<S>
+where
+    S: AsyncWrite + Unpin,
+{
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
