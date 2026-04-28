@@ -1,0 +1,14 @@
+[package]
+name = "audio-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = "1.6"
+clap = { version = "4.5", features = ["derive"] }
+http-body-util = "0.1"
+hyper = { version = "1.4", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "tokio"] }
+tokio = { version = "1.38", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
