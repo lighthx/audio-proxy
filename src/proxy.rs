@@ -6,6 +6,7 @@ use std::{
     str,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -211,7 +212,32 @@ impl ProxyServer {
             "CONNECT tunnel established"
         );
 
-        let _ = tokio::io::copy_bidirectional(&mut client_stream, &mut upstream_stream).await;
+        let started_at = Instant::now();
+
+        match tokio::io::copy_bidirectional(&mut client_stream, &mut upstream_stream).await {
+            Ok((client_to_target_bytes, target_to_client_bytes)) => {
+                info!(
+                    %peer_addr,
+                    host = %target.host,
+                    port = target.port,
+                    client_to_target_bytes,
+                    target_to_client_bytes,
+                    duration_ms = started_at.elapsed().as_millis(),
+                    "CONNECT tunnel closed"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    %peer_addr,
+                    host = %target.host,
+                    port = target.port,
+                    error = %err,
+                    duration_ms = started_at.elapsed().as_millis(),
+                    "CONNECT tunnel closed with error"
+                );
+            }
+        }
+
         Ok(())
     }
 
